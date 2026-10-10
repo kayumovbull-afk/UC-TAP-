@@ -1,0 +1,1416 @@
+"""UC Tap: Telegram Web App bot.
+
+aiogram 3 (bot) + FastAPI (Web App API) + SQLite. Ishga tushirish: python server.py
+Pul birliklari: UC balansi "santi-UC" (1 UC = 100), hamyon va narxlar so'mda butun son.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import hashlib
+import hmac
+import html
+import json
+import logging
+import os
+import re
+import sqlite3
+import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from urllib.parse import parse_qsl
+
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()  # .env
+    load_dotenv(Path(__file__).parent / "env.txt")  # env.txt (yashirin fayl ko'rinmasa)
+except ImportError:  # python-dotenv ixtiyoriy
+    pass
+
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("uckran")
+
+# ---------------------------------------------------------------- sozlamalar
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+WEBAPP_URL = os.getenv("WEBAPP_URL", "").strip().rstrip("/")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
+DB_PATH = os.getenv("DB_PATH", "uckran.db")
+PORT = int(os.getenv("PORT", "8000"))
+
+TAP_REWARD_UC = float(os.getenv("TAP_REWARD_UC", "0.2"))
+DAILY_LIMIT_UC = float(os.getenv("DAILY_LIMIT_UC", "20"))
+REFERRAL_BONUS_UC = int(os.getenv("REFERRAL_BONUS_UC", "2"))
+MIN_WITHDRAW_UC = int(os.getenv("MIN_WITHDRAW_UC", "120"))
+REQUIRED_REFERRALS = int(os.getenv("REQUIRED_REFERRALS", "10"))
+MAX_TAPS_PER_SEC = float(os.getenv("MAX_TAPS_PER_SEC", "20"))
+TZ_OFFSET_HOURS = float(os.getenv("TZ_OFFSET_HOURS", "5"))  # kun yangilanishi: Toshkent 00:00
+
+PAY_CARD = os.getenv("PAY_CARD", "").strip()  # hamyonni to'ldirish uchun karta raqami
+PAY_HOLDER = os.getenv("PAY_HOLDER", "").strip()
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "").strip().lstrip("@")  # "Yordam" tugmasi
+MIN_TOPUP = int(os.getenv("MIN_TOPUP", "5000"))
+MAX_TOPUP = int(os.getenv("MAX_TOPUP", "5000000"))
+CASHBACK_PERCENT = float(os.getenv("CASHBACK_PERCENT", "0"))  # bajarilgan buyurtmadan qaytariladigan foiz
+
+MIN_PAID_WITHDRAW = int(os.getenv("MIN_PAID_WITHDRAW", "60"))  # Stars bilan olingan UC: do'st shart emas
+
+
+def parse_star_packs():
+    """STAR_PACKS="60:70,120:140": (UC, Stars) juftliklari."""
+    raw = os.getenv("STAR_PACKS", "60:70,120:140,180:210,240:280,325:380")
+    out = []
+    for part in raw.split(","):
+        try:
+            u, st = part.strip().split(":")
+            if int(u) > 0 and int(st) > 0:
+                out.append((int(u), int(st)))
+        except ValueError:
+            pass
+    return out
+
+
+STAR_PACKS = parse_star_packs()
+STAR_PRICE = dict(STAR_PACKS)
+
+MAX_PENDING_WITHDRAWALS = 3
+MAX_OPEN_TOPUPS = 3
+MAX_OPEN_ORDERS = 5
+INITDATA_MAX_AGE = 3 * 24 * 3600
+
+TAP_C = max(1, round(TAP_REWARD_UC * 100))  # bitta bosish, santi-UC
+DAILY_LIMIT_C = round(DAILY_LIMIT_UC * 100)
+REF_C = REFERRAL_BONUS_UC * 100
+
+ROOT = Path(__file__).parent
+WEBAPP_DIR = ROOT / "webapp"
+CATALOG_FILE = ROOT / "catalog.json"
+bot = None  # aiogram Bot (BOT_TOKEN bo'lsa)
+BOT_USERNAME = ""
+
+
+def money(n: int) -> str:
+    return f"{n:,}".replace(",", " ")
+
+
+def day_key(t: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(t + TZ_OFFSET_HOURS * 3600))
+
+
+# ---------------------------------------------------------------- o'yinlar katalogi (catalog.json)
+def load_catalog() -> list:
+    default = [
+        {
+            "id": "pubg", "name": "PUBG Mobile", "short": "PM", "color": "#C98A12", "popular": True,
+            "id_label": "PUBG Mobile ID", "id_pattern": r"\d{6,14}",
+            "packages": [{"title": f"{u} UC", "price": p} for u, p in
+                         [(60, 12500), (120, 25000), (180, 40000), (240, 52000), (325, 62000)]],
+        }
+    ]
+    try:
+        data = json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        log.error("catalog.json o'qilmadi (%s), standart katalog ishlatiladi", e)
+        return default
+    out, seen = [], set()
+    for g in data:
+        try:
+            gid = str(g["id"])
+            if gid in seen:
+                continue
+            pattern = str(g.get("id_pattern", r".{3,64}"))
+            try:
+                re.compile(pattern)
+            except re.error:
+                pattern = r".{3,64}"
+            pk = []
+            for p in g.get("packages", []):
+                if int(p["price"]) <= 0:
+                    continue
+                st = int(p["stars"]) if p.get("stars") else None
+                m = re.fullmatch(r"\s*(\d+)\s*UC\s*", str(p["title"]), re.I)
+                if st is None and gid == "pubg" and m:
+                    st = STAR_PRICE.get(int(m.group(1)))   # PUBG UC: Stars narxi STAR_PACKS dan
+                pk.append({"title": str(p["title"]), "price": int(p["price"]), "stars": st})
+            out.append({
+                "id": gid, "name": str(g["name"]),
+                "short": str(g.get("short", g["name"][:2])).upper()[:3],
+                "color": str(g.get("color", "#556677")),
+                "id_label": str(g.get("id_label", "O’yin ID")),
+                "id_pattern": pattern, "popular": bool(g.get("popular", False)), "packages": pk,
+                "image": next((f"/games/{gid}{e}" for e in (".jpg", ".jpeg", ".png", ".webp", ".svg")
+                               if (WEBAPP_DIR / "games" / f"{gid}{e}").exists()), None) if re.fullmatch(r"[a-z0-9-]+", gid) else None,
+            })
+            seen.add(gid)
+        except Exception as e:
+            log.error("catalog.json: noto'g'ri yozuv o'tkazib yuborildi: %s", e)
+    return out or default
+
+
+CATALOG = load_catalog()
+CATALOG_BY_ID = {g["id"]: g for g in CATALOG}
+
+
+# ---------------------------------------------------------------- baza
+@contextlib.contextmanager
+def db():
+    con = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    con.row_factory = sqlite3.Row
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+@contextlib.contextmanager
+def tx():
+    """Atomik tranzaksiya (BEGIN IMMEDIATE): balans bilan ishlaganda poyga holatlarini oldini oladi."""
+    with db() as con:
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            yield con
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+
+
+def init_db():
+    with db() as con:
+        con.execute("PRAGMA journal_mode=WAL")
+        con.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                balance_c INTEGER NOT NULL DEFAULT 0,      -- UC (santi-UC)
+                day TEXT NOT NULL DEFAULT '',
+                today_c INTEGER NOT NULL DEFAULT 0,
+                last_tap_ts REAL NOT NULL DEFAULT 0,
+                tap_total INTEGER NOT NULL DEFAULT 0,
+                referrer_id INTEGER,
+                ref_count INTEGER NOT NULL DEFAULT 0,
+                ref_earned_c INTEGER NOT NULL DEFAULT 0,
+                wallet INTEGER NOT NULL DEFAULT 0,         -- hamyon, so'm
+                spent INTEGER NOT NULL DEFAULT 0,          -- bajarilgan buyurtmalar summasi, so'm
+                cashback_total INTEGER NOT NULL DEFAULT 0, -- jami cashback, so'm
+                notify INTEGER NOT NULL DEFAULT 1,
+                paid_c INTEGER NOT NULL DEFAULT 0,         -- Stars bilan olingan UC (balans ichida)
+                banned INTEGER NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS withdrawals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                amount_c INTEGER NOT NULL,
+                pubg_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',  -- pending | paid | rejected
+                created_at REAL NOT NULL,
+                admin_id INTEGER,
+                processed_at REAL,
+                paid_part_c INTEGER NOT NULL DEFAULT 0,  -- shundan Stars UC qismi
+                code TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_wd_user ON withdrawals(user_id);
+            CREATE INDEX IF NOT EXISTS idx_wd_status ON withdrawals(status);
+            CREATE TABLE IF NOT EXISTS topups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,                  -- so'm
+                status TEXT NOT NULL DEFAULT 'awaiting',  -- awaiting | review | done | rejected
+                receipt_file_id TEXT,
+                created_at REAL NOT NULL,
+                admin_id INTEGER,
+                processed_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_top_user ON topups(user_id);
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                game TEXT NOT NULL,
+                title TEXT NOT NULL,
+                price INTEGER NOT NULL,                   -- so'm, hamyondan darhol ushlanadi
+                account TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'processing',  -- unpaid | processing | done | rejected
+                created_at REAL NOT NULL,
+                admin_id INTEGER,
+                processed_at REAL,
+                code TEXT,
+                pay TEXT NOT NULL DEFAULT 'wallet',       -- wallet | stars
+                stars INTEGER NOT NULL DEFAULT 0,
+                charge_id TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_ord_user ON orders(user_id);
+            CREATE TABLE IF NOT EXISTS star_payments (
+                charge_id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                stars INTEGER NOT NULL,
+                uc INTEGER NOT NULL,
+                created_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uc INTEGER NOT NULL,
+                code TEXT NOT NULL UNIQUE,
+                used_by INTEGER,
+                used_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS idx_codes_uc ON codes(uc, used_by);
+            """
+        )
+        # eski bazalarni yangilash
+        for tbl, col, ddl in [
+            ("users", "paid_c", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "wallet", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "spent", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "cashback_total", "INTEGER NOT NULL DEFAULT 0"),
+            ("users", "notify", "INTEGER NOT NULL DEFAULT 1"),
+            ("withdrawals", "paid_part_c", "INTEGER NOT NULL DEFAULT 0"),
+            ("withdrawals", "code", "TEXT"),
+            ("orders", "code", "TEXT"),
+            ("orders", "pay", "TEXT NOT NULL DEFAULT 'wallet'"),
+            ("orders", "stars", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "charge_id", "TEXT"),
+        ]:
+            have = {r["name"] for r in con.execute(f"PRAGMA table_info({tbl})")}
+            if col not in have:
+                con.execute(f"ALTER TABLE {tbl} ADD COLUMN {col} {ddl}")
+
+
+def upsert_user(con, tg_user: dict, t: float):
+    """Foydalanuvchini yaratadi yoki yangilaydi. (qator, yangi_yaratildimi) qaytaradi."""
+    uid = tg_user["id"]
+    name = tg_user.get("first_name") or ""
+    uname = tg_user.get("username")
+    row = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if row is None:
+        con.execute(
+            "INSERT INTO users(id, username, first_name, last_tap_ts, created_at) VALUES(?,?,?,?,?)",
+            (uid, uname, name, t, t),
+        )
+        return con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone(), True
+    if row["username"] != uname or row["first_name"] != name:
+        con.execute("UPDATE users SET username=?, first_name=? WHERE id=?", (uname, name, uid))
+        row = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    return row, False
+
+
+def parse_ref(param):
+    if param and param.startswith("ref_") and param[4:].isdigit():
+        return int(param[4:])
+    return None
+
+
+def apply_referral(con, uid: int, referrer_id):
+    """Faqat YANGI yaratilgan foydalanuvchi uchun chaqiriladi. Taklif qilgan odamga bonus yozadi."""
+    if not referrer_id or referrer_id == uid:
+        return None
+    ref = con.execute("SELECT id, banned FROM users WHERE id=?", (referrer_id,)).fetchone()
+    if not ref or ref["banned"]:
+        return None
+    cur = con.execute(
+        "UPDATE users SET referrer_id=? WHERE id=? AND referrer_id IS NULL", (referrer_id, uid)
+    )
+    if cur.rowcount != 1:
+        return None
+    con.execute(
+        "UPDATE users SET balance_c=balance_c+?, ref_count=ref_count+1, ref_earned_c=ref_earned_c+? WHERE id=?",
+        (REF_C, REF_C, referrer_id),
+    )
+    return referrer_id
+
+
+# ---- hamyonni to'ldirish (chek rasmi bilan)
+def create_topup(con, uid: int, amount: int, t: float) -> int:
+    return con.execute(
+        "INSERT INTO topups(user_id, amount, created_at) VALUES(?,?,?)", (uid, amount, t)
+    ).lastrowid
+
+
+def attach_receipt(con, uid: int, file_id: str, t: float):
+    """Foydalanuvchining oxirgi 'chek kutilmoqda' to'ldirishiga chekni biriktiradi."""
+    row = con.execute(
+        "SELECT id FROM topups WHERE user_id=? AND status='awaiting' ORDER BY id DESC LIMIT 1", (uid,)
+    ).fetchone()
+    if not row:
+        return None
+    con.execute("UPDATE topups SET status='review', receipt_file_id=? WHERE id=?", (file_id, row["id"]))
+    return con.execute("SELECT * FROM topups WHERE id=?", (row["id"],)).fetchone()
+
+
+def decide_topup(con, tid: int, status: str, admin_id: int, t: float):
+    """Admin qarori: 'done' (hamyon to'ldiriladi) yoki 'rejected'. (qator, o'zgardimi) qaytaradi."""
+    row = con.execute("SELECT * FROM topups WHERE id=?", (tid,)).fetchone()
+    if not row:
+        return None, False
+    if row["status"] != "review":
+        return row, False
+    con.execute(
+        "UPDATE topups SET status=?, admin_id=?, processed_at=? WHERE id=?", (status, admin_id, t, tid)
+    )
+    if status == "done":
+        con.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (row["amount"], row["user_id"]))
+    return row, True
+
+
+# ---- buyurtmalar (hamyondan to'lanadi)
+def create_order(con, uid: int, game: str, title: str, price: int, account: str, t: float) -> int:
+    return con.execute(
+        "INSERT INTO orders(user_id, game, title, price, account, created_at) VALUES(?,?,?,?,?,?)",
+        (uid, game, title, price, account, t),
+    ).lastrowid
+
+
+def decide_order(con, oid: int, status: str, admin_id: int, t: float):
+    """Admin qarori. 'done': sarflandi + cashback; 'rejected': pul hamyonga qaytadi.
+    (buyurtma, o'zgardimi, cashback, kod) qaytaradi. Zaxirada kod bo'lsa PUBG UC buyurtmaga avtomatik beriladi."""
+    o = con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if not o:
+        return None, False, 0, None
+    if o["status"] != "processing":
+        return o, False, 0, None
+    con.execute(
+        "UPDATE orders SET status=?, admin_id=?, processed_at=? WHERE id=?", (status, admin_id, t, oid)
+    )
+    cb = 0
+    code = None
+    if status == "done":
+        uc = uc_of_title(o["title"]) if o["game"] == "pubg" else None
+        if uc:
+            code = take_code(con, uc, o["user_id"], t)
+            if code:
+                con.execute("UPDATE orders SET code=? WHERE id=?", (code, oid))
+        cb = int(o["price"] * CASHBACK_PERCENT / 100)
+        con.execute(
+            "UPDATE users SET spent=spent+?, wallet=wallet+?, cashback_total=cashback_total+? WHERE id=?",
+            (o["price"], cb, cb, o["user_id"]),
+        )
+    else:
+        if o["pay"] == "wallet":  # Stars bilan to'langan bo'lsa, Stars qaytariladi (bot orqali)
+            con.execute("UPDATE users SET wallet=wallet+? WHERE id=?", (o["price"], o["user_id"]))
+    return o, True, cb, code
+
+
+def mark_order_paid(con, uid: int, oid: int, stars: int, charge_id: str, t: float):
+    """Stars bilan to'langan buyurtmani 'processing' ga o'tkazadi. Buyurtma qatorini yoki None qaytaradi."""
+    o = con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if not o or o["user_id"] != uid or o["status"] != "unpaid" or o["pay"] != "stars" or o["stars"] != stars:
+        return None
+    cur = con.execute(
+        "INSERT OR IGNORE INTO star_payments(charge_id, user_id, stars, uc, created_at) VALUES(?,?,?,?,?)",
+        (charge_id, uid, stars, 0, t),
+    )
+    if cur.rowcount != 1:
+        return None
+    con.execute("UPDATE orders SET status='processing', charge_id=? WHERE id=?", (charge_id, oid))
+    return con.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+
+
+def decide_withdrawal(con, wid: int, status: str, admin_id: int, t: float):
+    """Admin qarori: 'paid' | 'rejected'. (qator, o'zgardimi, kod) qaytaradi."""
+    w = con.execute("SELECT * FROM withdrawals WHERE id=?", (wid,)).fetchone()
+    if not w:
+        return None, False, None
+    if w["status"] != "pending":
+        return w, False, None
+    con.execute(
+        "UPDATE withdrawals SET status=?, admin_id=?, processed_at=? WHERE id=?", (status, admin_id, t, wid)
+    )
+    code = None
+    if status == "rejected":  # pulni qaytaramiz
+        con.execute(
+            "UPDATE users SET balance_c=balance_c+?, paid_c=paid_c+? WHERE id=?",
+            (w["amount_c"], w["paid_part_c"], w["user_id"]),
+        )
+    else:
+        code = take_code(con, w["amount_c"] // 100, w["user_id"], t) if w["amount_c"] % 100 == 0 else None
+        if code:
+            con.execute("UPDATE withdrawals SET code=? WHERE id=?", (code, wid))
+    return w, True, code
+
+
+# ---- Stars → UC
+def credit_stars(con, uid: int, uc: int, stars: int, charge_id: str, t: float) -> bool:
+    """Stars to'lovi uchun UC yozadi. Bir xil charge_id ikki marta yozilmaydi. True = yangi yozildi."""
+    if STAR_PRICE.get(uc) != stars:
+        log.error("Stars to'lovi mos emas: uid=%s uc=%s stars=%s", uid, uc, stars)
+        return False
+    if not con.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone():
+        return False
+    cur = con.execute(
+        "INSERT OR IGNORE INTO star_payments(charge_id, user_id, stars, uc, created_at) VALUES(?,?,?,?,?)",
+        (charge_id, uid, stars, uc, t),
+    )
+    if cur.rowcount != 1:
+        return False
+    con.execute(
+        "UPDATE users SET balance_c=balance_c+?, paid_c=paid_c+? WHERE id=?", (uc * 100, uc * 100, uid)
+    )
+    return True
+
+
+# ---- UC kodlari zaxirasi (avtomatik yetkazish)
+def add_codes(con, uc: int, codes: list) -> int:
+    n = 0
+    for c in codes:
+        n += con.execute("INSERT OR IGNORE INTO codes(uc, code) VALUES(?,?)", (uc, c)).rowcount
+    return n
+
+
+def take_code(con, uc: int, uid: int, t: float):
+    r = con.execute(
+        "SELECT id, code FROM codes WHERE uc=? AND used_by IS NULL ORDER BY id LIMIT 1", (uc,)
+    ).fetchone()
+    if not r:
+        return None
+    con.execute("UPDATE codes SET used_by=?, used_at=? WHERE id=?", (uid, t, r["id"]))
+    return r["code"]
+
+
+def uc_of_title(title: str):
+    m = re.fullmatch(r"\s*(\d+)\s*UC\s*", title, re.I)
+    return int(m.group(1)) if m else None
+
+
+REDEEM_NOTE = "Kodni PUBG Mobile ID ingiz bilan midasbuy.com sahifasida (Redeem Code) faollashtiring."
+
+
+def ref_link(uid: int) -> str:
+    return f"https://t.me/{BOT_USERNAME or 'YOUR_BOT'}?start=ref_{uid}"
+
+
+def state_payload(con, uid: int, t: float) -> dict:
+    row = con.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    wds = con.execute(
+        "SELECT id, amount_c, pubg_id, status, created_at, code FROM withdrawals"
+        " WHERE user_id=? ORDER BY id DESC LIMIT 15",
+        (uid,),
+    ).fetchall()
+    ords = con.execute(
+        "SELECT id, game, title, price, account, status, created_at, code, pay, stars FROM orders"
+        " WHERE user_id=? AND status!='unpaid' ORDER BY id DESC LIMIT 20",
+        (uid,),
+    ).fetchall()
+    tops = con.execute(
+        "SELECT id, amount, status, created_at FROM topups WHERE user_id=? ORDER BY id DESC LIMIT 15",
+        (uid,),
+    ).fetchall()
+    n_orders = con.execute(
+        "SELECT COUNT(*) FROM orders WHERE user_id=? AND status NOT IN ('rejected','unpaid')", (uid,)
+    ).fetchone()[0]
+    today = row["today_c"] if row["day"] == day_key(t) else 0
+    return {
+        "user": {"id": uid, "name": row["first_name"] or row["username"] or str(uid)},
+        "balance_c": row["balance_c"],
+        "paid_c": row["paid_c"],
+        "min_paid_withdraw": MIN_PAID_WITHDRAW,
+        "star_packs": [{"uc": u, "stars": st} for u, st in STAR_PACKS],
+        "today_c": today,
+        "daily_limit_c": DAILY_LIMIT_C,
+        "tap_c": TAP_C,
+        "min_withdraw_uc": MIN_WITHDRAW_UC,
+        "required_refs": REQUIRED_REFERRALS,
+        "ref_bonus_uc": REFERRAL_BONUS_UC,
+        "ref_count": row["ref_count"],
+        "ref_earned_c": row["ref_earned_c"],
+        "ref_link": ref_link(uid),
+        "wallet": row["wallet"],
+        "spent": row["spent"],
+        "cashback": row["cashback_total"],
+        "orders_count": n_orders,
+        "notify": bool(row["notify"]),
+        "min_topup": MIN_TOPUP,
+        "max_topup": MAX_TOPUP,
+        "support": SUPPORT_USERNAME,
+        "pay": {"card": PAY_CARD, "holder": PAY_HOLDER} if PAY_CARD else None,
+        "catalog": CATALOG,
+        "withdrawals": [
+            {
+                "id": w["id"],
+                "amount_uc": w["amount_c"] // 100,
+                "pubg_id": w["pubg_id"],
+                "status": w["status"],
+                "created_at": w["created_at"],
+                "code": w["code"],
+            }
+            for w in wds
+        ],
+        "orders": [
+            {
+                "id": o["id"],
+                "game": o["game"],
+                "game_name": CATALOG_BY_ID.get(o["game"], {}).get("name", o["game"]),
+                "title": o["title"],
+                "price": o["price"],
+                "account": o["account"],
+                "status": o["status"],
+                "created_at": o["created_at"],
+                "code": o["code"],
+                "pay": o["pay"],
+                "stars": o["stars"],
+            }
+            for o in ords
+        ],
+        "topups": [
+            {"id": x["id"], "amount": x["amount"], "status": x["status"], "created_at": x["created_at"]}
+            for x in tops
+        ],
+    }
+
+
+# ---------------------------------------------------------------- Telegram initData tekshiruvi
+def authenticate(init_data: str):
+    """Web App initData imzosini tekshiradi. (tg_user dict, start_param) qaytaradi."""
+    if not init_data:
+        raise HTTPException(401, "Botni Telegram ichida oching.")
+    # Faqat BOT_TOKEN bo'lmagan lokal sinovda: "dev:<id>[:ref_<id>]"
+    if not BOT_TOKEN:
+        if init_data.startswith("dev:"):
+            parts = init_data.split(":")
+            try:
+                uid = int(parts[1])
+            except (IndexError, ValueError):
+                raise HTTPException(401, "dev auth xato")
+            return {"id": uid, "first_name": f"Dev{uid}", "username": None}, (
+                parts[2] if len(parts) > 2 else None
+            )
+        raise HTTPException(503, "Server sozlanmagan (BOT_TOKEN yo'q).")
+    data = dict(parse_qsl(init_data, keep_blank_values=True))
+    got = data.pop("hash", "")
+    check = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(calc, got):
+        raise HTTPException(401, "Imzo noto'g'ri.")
+    try:
+        if time.time() - int(data.get("auth_date", "0")) > INITDATA_MAX_AGE:
+            raise HTTPException(401, "Sessiya eskirgan. Botni qayta oching.")
+        user = json.loads(data["user"])
+        int(user["id"])
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(401, "initData buzilgan.")
+    return user, data.get("start_param")
+
+
+# ---------------------------------------------------------------- bildirishnomalar
+def who_link(user_id, name, username=None) -> str:
+    s = f'<a href="tg://user?id={user_id}">{html.escape(name or str(user_id))}</a>'
+    if username:
+        s += f" @{html.escape(username)}"
+    return s
+
+
+async def notify(uid: int, text: str, **kw):
+    if not bot:
+        return
+    try:
+        await bot.send_message(uid, text, **kw)
+    except Exception as e:  # foydalanuvchi botni bloklagan bo'lishi mumkin
+        log.warning("notify %s failed: %s", uid, e)
+
+
+async def notify_bonus(uid: int, text: str):
+    """Referal bonusi xabari: foydalanuvchi bildirishnomani o'chirgan bo'lsa yuborilmaydi."""
+    with db() as con:
+        r = con.execute("SELECT notify FROM users WHERE id=?", (uid,)).fetchone()
+    if r and r["notify"]:
+        await notify(uid, text)
+
+
+async def notify_admins_withdrawal(wid, user_id, name, username, amount_uc, pubg, refs):
+    if not bot or not ADMIN_IDS:
+        return
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    text = (
+        f"💸 <b>Yangi yechish so’rovi #{wid}</b>\n"
+        f"Foydalanuvchi: {who_link(user_id, name, username)} (<code>{user_id}</code>)\n"
+        f"Summa: <b>{amount_uc} UC</b>\n"
+        f"PUBG ID: <code>{html.escape(pubg)}</code>\n"
+        f"Taklif qilgan do’stlari: {refs}\n\n"
+        f"Zaxirada kod bo’lsa «To’landi» bosilganda foydalanuvchiga avtomatik yuboriladi. "
+        f"Bo’lmasa UC ni o’zingiz yuborib, keyin «To’landi» ni bosing."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ To’landi", callback_data=f"wd:ok:{wid}"),
+                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"wd:no:{wid}"),
+            ]
+        ]
+    )
+    for admin in ADMIN_IDS:
+        await notify(admin, text, reply_markup=kb)
+
+
+async def notify_admins_topup(t_row, file_id, name, username):
+    if not bot or not ADMIN_IDS:
+        return
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    caption = (
+        f"💳 <b>Balansni to’ldirish #{t_row['id']}</b>\n"
+        f"Foydalanuvchi: {who_link(t_row['user_id'], name, username)} (<code>{t_row['user_id']}</code>)\n"
+        f"Summa: <b>{money(t_row['amount'])} so’m</b>\n\n"
+        f"Pul kartaga tushganini tekshiring, so’ng «Tasdiqlash» ni bosing."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Tasdiqlash", callback_data=f"top:ok:{t_row['id']}"),
+                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"top:no:{t_row['id']}"),
+            ]
+        ]
+    )
+    for admin in ADMIN_IDS:
+        try:
+            await bot.send_photo(admin, file_id, caption=caption, reply_markup=kb)
+        except Exception as e:
+            log.warning("topup notify %s failed: %s", admin, e)
+
+
+async def notify_admins_order(oid, user_id, name, username, game_name, title, price, account, stars=0):
+    if not bot or not ADMIN_IDS:
+        return
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
+    text = (
+        f"🛒 <b>Yangi buyurtma #{oid}</b>\n"
+        f"Foydalanuvchi: {who_link(user_id, name, username)} (<code>{user_id}</code>)\n"
+        f"O’yin: <b>{html.escape(game_name)}</b>\n"
+        f"Paket: <b>{html.escape(title)}</b> · "
+        + (f"⭐ {stars} Stars to’langan (botingiz hisobiga tushdi)" if stars else f"{money(price)} so’m (hamyondan to’langan)")
+        + "\n"
+        f"ID: <code>{html.escape(account)}</code>\n\n"
+        f"PUBG UC uchun zaxirada kod bo’lsa «Yuborildi» bosilganda avtomatik yuboriladi. "
+        f"Boshqa xizmatni o’zingiz yuborib, keyin «Yuborildi» ni bosing."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Yuborildi", callback_data=f"ord:ok:{oid}"),
+                InlineKeyboardButton(text="❌ Rad etish", callback_data=f"ord:no:{oid}"),
+            ]
+        ]
+    )
+    for admin in ADMIN_IDS:
+        await notify(admin, text, reply_markup=kb)
+
+
+# ---------------------------------------------------------------- bot (aiogram)
+def build_dispatcher():
+    from aiogram import Dispatcher, F, Router
+    from aiogram.filters import Command, CommandObject, CommandStart
+    from aiogram.types import (
+        CallbackQuery,
+        InlineKeyboardButton,
+        InlineKeyboardMarkup,
+        Message,
+        PreCheckoutQuery,
+        WebAppInfo,
+    )
+
+    router = Router()
+
+    def open_kb():
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🎮 Tapni ochish", web_app=WebAppInfo(url=WEBAPP_URL))]
+            ]
+        )
+
+    @router.message(CommandStart())
+    async def start(m: Message, command: CommandObject):
+        u = m.from_user
+        referrer = None
+        with tx() as con:
+            _, created = upsert_user(
+                con, {"id": u.id, "first_name": u.first_name, "username": u.username}, time.time()
+            )
+            if created:
+                referrer = apply_referral(con, u.id, parse_ref(command.args))
+        if referrer:
+            await notify_bonus(referrer, f"🎉 Yangi do’st qo’shildi! Hisobingizga +{REFERRAL_BONUS_UC} UC yozildi.")
+        await m.answer(
+            "👋 <b>UC Tap</b>ga xush kelibsiz!\n\n"
+            f"• Tangani bosing: har bosish +{TAP_C / 100:g} UC (kuniga {DAILY_LIMIT_C / 100:g} UC gacha)\n"
+            f"• Do’st taklif qiling: har biri uchun +{REFERRAL_BONUS_UC} UC\n"
+            f"• {REQUIRED_REFERRALS} ta do’st va {MIN_WITHDRAW_UC} UC bo’lsa, PUBG ID ga yechib oling\n"
+            "• ⭐ Stars ni UC ga almashtiring («To’ldirish» bo’limi)\n"
+            "• Hamyonni to’ldirib, «O’yinlar» bo’limidan sotib oling",
+            reply_markup=open_kb(),
+        )
+
+    @router.message(Command("balans"))
+    async def balans(m: Message):
+        with db() as con:
+            row = con.execute(
+                "SELECT balance_c, wallet FROM users WHERE id=?", (m.from_user.id,)
+            ).fetchone()
+        if not row:
+            return await m.answer("Avval /start bosing.")
+        await m.answer(
+            f"💰 UC balans: <b>{row['balance_c'] / 100:.2f} UC</b>\n"
+            f"👛 Hamyon: <b>{money(row['wallet'])} so’m</b>",
+            reply_markup=open_kb(),
+        )
+
+    @router.message(Command("referal"))
+    async def referal(m: Message):
+        with db() as con:
+            row = con.execute(
+                "SELECT ref_count, ref_earned_c FROM users WHERE id=?", (m.from_user.id,)
+            ).fetchone()
+        if not row:
+            return await m.answer("Avval /start bosing.")
+        await m.answer(
+            f"👥 Taklif qilinganlar: <b>{row['ref_count']}/{REQUIRED_REFERRALS}</b> (yechish uchun kerak)\n"
+            f"🎁 Referaldan topilgan: <b>{row['ref_earned_c'] / 100:.2f} UC</b>\n\n"
+            f"Havolangiz:\n<code>{ref_link(m.from_user.id)}</code>"
+        )
+
+    @router.message(Command("stats"))
+    async def stats(m: Message):
+        if m.from_user.id not in ADMIN_IDS:
+            return
+        with db() as con:
+            users = con.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(balance_c),0) s, COALESCE(SUM(wallet),0) w FROM users"
+            ).fetchone()
+            pend = con.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(amount_c),0) s FROM withdrawals WHERE status='pending'"
+            ).fetchone()
+            paid = con.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(amount_c),0) s FROM withdrawals WHERE status='paid'"
+            ).fetchone()
+            ord_wait = con.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(price),0) s FROM orders WHERE status='processing'"
+            ).fetchone()
+            ord_done = con.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(price),0) s FROM orders WHERE status='done'"
+            ).fetchone()
+            top_wait = con.execute("SELECT COUNT(*) FROM topups WHERE status='review'").fetchone()[0]
+            stars = con.execute("SELECT COUNT(*) c, COALESCE(SUM(stars),0) s, COALESCE(SUM(uc),0) u FROM star_payments").fetchone()
+            top_done = con.execute(
+                "SELECT COUNT(*) c, COALESCE(SUM(amount),0) s FROM topups WHERE status='done'"
+            ).fetchone()
+        await m.answer(
+            f"📊 Foydalanuvchilar: <b>{users['c']}</b>\n"
+            f"UC balanslari jami (to’lanmagan majburiyat): <b>{users['s'] / 100:.2f} UC</b>\n"
+            f"Kutilayotgan yechish: <b>{pend['c']}</b> ({pend['s'] / 100:.0f} UC)\n"
+            f"To’langan yechish: <b>{paid['c']}</b> ({paid['s'] / 100:.0f} UC)\n\n"
+            f"👛 Hamyonlardagi pul: <b>{money(users['w'])}</b> so’m\n"
+            f"💳 Tasdiqlangan to’ldirish: <b>{top_done['c']}</b> ta, <b>{money(top_done['s'])}</b> so’m\n"
+            f"Tekshiruv kutayotgan chek: <b>{top_wait}</b>\n"
+            f"⭐ Stars: <b>{stars['c']}</b> ta to’lov, <b>{stars['s']}</b> Stars → <b>{stars['u']}</b> UC\n"
+            f"🛒 Bajarilmagan buyurtma: <b>{ord_wait['c']}</b> ta ({money(ord_wait['s'])} so’m)\n"
+            f"Bajarilgan buyurtma: <b>{ord_done['c']}</b> ta ({money(ord_done['s'])} so’m)"
+        )
+
+    @router.message(Command("pending"))
+    async def pending(m: Message):
+        if m.from_user.id not in ADMIN_IDS:
+            return
+        with db() as con:
+            wds = con.execute(
+                "SELECT w.id, w.user_id, w.amount_c, w.pubg_id, u.first_name"
+                " FROM withdrawals w JOIN users u ON u.id=w.user_id"
+                " WHERE w.status='pending' ORDER BY w.id LIMIT 20"
+            ).fetchall()
+            ords = con.execute(
+                "SELECT o.id, o.user_id, o.game, o.title, o.price, o.account, u.first_name"
+                " FROM orders o JOIN users u ON u.id=o.user_id"
+                " WHERE o.status='processing' ORDER BY o.id LIMIT 20"
+            ).fetchall()
+        if not wds and not ords:
+            return await m.answer("Kutilayotgan so’rov yo’q.")
+        for r in wds:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ To’landi", callback_data=f"wd:ok:{r['id']}"),
+                        InlineKeyboardButton(text="❌ Rad etish", callback_data=f"wd:no:{r['id']}"),
+                    ]
+                ]
+            )
+            await m.answer(
+                f"💸 <b>Yechish #{r['id']}</b> {who_link(r['user_id'], r['first_name'])}\n"
+                f"{r['amount_c'] // 100} UC → PUBG ID <code>{html.escape(r['pubg_id'])}</code>",
+                reply_markup=kb,
+            )
+        for r in ords:
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(text="✅ Yuborildi", callback_data=f"ord:ok:{r['id']}"),
+                        InlineKeyboardButton(text="❌ Rad etish", callback_data=f"ord:no:{r['id']}"),
+                    ]
+                ]
+            )
+            gname = CATALOG_BY_ID.get(r["game"], {}).get("name", r["game"])
+            await m.answer(
+                f"🛒 <b>Buyurtma #{r['id']}</b> {who_link(r['user_id'], r['first_name'])}\n"
+                f"{html.escape(gname)}: {html.escape(r['title'])} · {money(r['price'])} so’m\n"
+                f"ID: <code>{html.escape(r['account'])}</code>",
+                reply_markup=kb,
+            )
+
+    @router.message(Command("addcodes"))
+    async def addcodes_cmd(m: Message, command: CommandObject):
+        """/addcodes 60 KOD1 KOD2 ...  (yoki kodlar qator-qator)"""
+        if m.from_user.id not in ADMIN_IDS:
+            return
+        parts = (command.args or "").split()
+        if len(parts) < 2 or not parts[0].isdigit():
+            return await m.answer("Format: <code>/addcodes 60 KOD1 KOD2 KOD3</code>\n(60 — paket UC miqdori)")
+        with tx() as con:
+            n = add_codes(con, int(parts[0]), parts[1:])
+        await m.answer(f"✅ {n} ta yangi kod qo’shildi ({int(parts[0])} UC). Takrorlari o’tkazib yuborildi.")
+
+    @router.message(Command("codes"))
+    async def codes_cmd(m: Message):
+        if m.from_user.id not in ADMIN_IDS:
+            return
+        with db() as con:
+            rows = con.execute(
+                "SELECT uc, SUM(used_by IS NULL) free, COUNT(*) total FROM codes GROUP BY uc ORDER BY uc"
+            ).fetchall()
+        if not rows:
+            return await m.answer("Kod zaxirasi bo’sh. /addcodes 60 KOD1 KOD2 …")
+        await m.answer("🔑 Kod zaxirasi:\n" + "\n".join(f"{r['uc']} UC: <b>{r['free']}</b> ta bo’sh (jami {r['total']})" for r in rows))
+
+    @router.pre_checkout_query()
+    async def pre_checkout(q: PreCheckoutQuery):
+        ok = False
+        try:
+            parts = q.invoice_payload.split(":")
+            if parts[0] == "uc":
+                ok = (
+                    int(parts[1]) == q.from_user.id and q.currency == "XTR"
+                    and STAR_PRICE.get(int(parts[2])) == q.total_amount
+                )
+            elif parts[0] == "buy":
+                with db() as con:
+                    o = con.execute("SELECT * FROM orders WHERE id=?", (int(parts[1]),)).fetchone()
+                ok = bool(
+                    o and o["user_id"] == q.from_user.id and o["status"] == "unpaid"
+                    and o["pay"] == "stars" and o["stars"] == q.total_amount and q.currency == "XTR"
+                )
+        except (ValueError, IndexError):
+            pass
+        await q.answer(ok=ok, error_message=None if ok else "To’lov ma’lumoti noto’g’ri. Ilovadan qayta urining.")
+
+    @router.message(F.successful_payment)
+    async def stars_paid(m: Message):
+        sp = m.successful_payment
+        parts = sp.invoice_payload.split(":")
+        try:
+            if parts[0] == "buy":
+                with tx() as con:
+                    o = mark_order_paid(con, m.from_user.id, int(parts[1]), sp.total_amount,
+                                        sp.telegram_payment_charge_id, time.time())
+                    u = con.execute("SELECT first_name, username FROM users WHERE id=?", (m.from_user.id,)).fetchone()
+                if not o:
+                    log.error("Stars buyurtma to'lovi yozilmadi: %s", sp.telegram_payment_charge_id)
+                    return
+                game = CATALOG_BY_ID.get(o["game"], {}).get("name", o["game"])
+                await m.answer(
+                    f"✅ {sp.total_amount} ⭐ qabul qilindi. Buyurtma #{o['id']} ({html.escape(game)} {html.escape(o['title'])}) "
+                    "qabul qilindi. Admin tasdiqlagach UC yuboriladi."
+                )
+                await notify_admins_order(o["id"], o["user_id"], u["first_name"], u["username"], game,
+                                          o["title"], o["price"], o["account"], stars=o["stars"])
+                return
+            uc = int(parts[2])
+        except (ValueError, IndexError):
+            log.error("Noma'lum to'lov payload: %s", sp.invoice_payload)
+            return
+        with tx() as con:
+            new = credit_stars(con, m.from_user.id, uc, sp.total_amount, sp.telegram_payment_charge_id, time.time())
+        if new:
+            await m.answer(f"✅ {sp.total_amount} ⭐ qabul qilindi. Balansingizga <b>+{uc} UC</b> yozildi!", reply_markup=open_kb())
+        else:
+            log.error("Stars to'lovi yozilmadi: %s", sp.telegram_payment_charge_id)
+
+    @router.message(F.photo)
+    async def receipt(m: Message):
+        """Foydalanuvchi to'lov chekini (rasm) yuboradi."""
+        file_id = m.photo[-1].file_id
+        with tx() as con:
+            t = attach_receipt(con, m.from_user.id, file_id, time.time())
+        if not t:
+            return await m.answer("Avval ilovadagi «To’ldirish» bo’limida summani tanlang, keyin chekni yuboring.")
+        await m.answer(
+            f"✅ Chek qabul qilindi (#{t['id']}, {money(t['amount'])} so’m). Admin tekshirgach hamyoningiz to’ldiriladi."
+        )
+        await notify_admins_topup(t, file_id, m.from_user.full_name, m.from_user.username)
+
+    async def edit_decided(cb: CallbackQuery, label: str):
+        if not cb.message:
+            return
+        with contextlib.suppress(Exception):
+            txt = f"{cb.message.html_text or ''}\n\n{label} — {html.escape(cb.from_user.full_name)}"
+            if cb.message.photo:
+                await cb.message.edit_caption(caption=txt, reply_markup=None)
+            else:
+                await cb.message.edit_text(txt, reply_markup=None)
+
+    @router.callback_query(F.data.startswith("wd:"))
+    async def withdraw_decision(cb: CallbackQuery):
+        if cb.from_user.id not in ADMIN_IDS:
+            return await cb.answer("Ruxsat yo’q", show_alert=True)
+        try:
+            _, action, wid_s = cb.data.split(":")
+            wid = int(wid_s)
+        except ValueError:
+            return await cb.answer("Xato")
+        status = "paid" if action == "ok" else "rejected"
+        with tx() as con:
+            w, done, code = decide_withdrawal(con, wid, status, cb.from_user.id, time.time())
+        if not w:
+            return await cb.answer("So’rov topilmadi", show_alert=True)
+        if not done:
+            return await cb.answer("Bu so’rov allaqachon ko’rib chiqilgan", show_alert=True)
+        auto = "\n🔑 Kod foydalanuvchiga avtomatik yuborildi." if code else (
+            "\n⚠️ Zaxirada kod yo’q: UC ni o’zingiz yuborganingizga ishonch hosil qiling." if status == "paid" else "")
+        await edit_decided(cb, ("✅ To’landi" if status == "paid" else "❌ Rad etildi (balans qaytarildi)") + auto)
+        if status == "paid":
+            if code:
+                await notify(
+                    w["user_id"],
+                    f"✅ {w['amount_c'] // 100} UC tasdiqlandi!\n🔑 Kod: <code>{html.escape(code)}</code>\n{REDEEM_NOTE}",
+                )
+            else:
+                await notify(
+                    w["user_id"],
+                    f"✅ {w['amount_c'] // 100} UC PUBG ID <code>{html.escape(w['pubg_id'])}</code> ga yuborildi!",
+                )
+        else:
+            await notify(
+                w["user_id"],
+                f"❌ {w['amount_c'] // 100} UC so’rovingiz rad etildi. Mablag’ balansingizga qaytarildi.",
+            )
+        await cb.answer("Tayyor")
+
+    @router.callback_query(F.data.startswith("top:"))
+    async def topup_decision(cb: CallbackQuery):
+        if cb.from_user.id not in ADMIN_IDS:
+            return await cb.answer("Ruxsat yo’q", show_alert=True)
+        try:
+            _, action, tid_s = cb.data.split(":")
+            tid = int(tid_s)
+        except ValueError:
+            return await cb.answer("Xato")
+        status = "done" if action == "ok" else "rejected"
+        with tx() as con:
+            row, done = decide_topup(con, tid, status, cb.from_user.id, time.time())
+        if not row:
+            return await cb.answer("To’lov topilmadi", show_alert=True)
+        if not done:
+            return await cb.answer("Bu to’lov allaqachon ko’rib chiqilgan", show_alert=True)
+        await edit_decided(cb, "✅ Tasdiqlandi" if status == "done" else "❌ Rad etildi")
+        if status == "done":
+            await notify(row["user_id"], f"✅ Hamyoningiz <b>{money(row['amount'])} so’m</b> ga to’ldirildi.")
+        else:
+            await notify(
+                row["user_id"],
+                f"❌ #{row['id']} to’lovingiz tasdiqlanmadi. Savol bo’lsa, admin bilan bog’laning.",
+            )
+        await cb.answer("Tayyor")
+
+    @router.callback_query(F.data.startswith("ord:"))
+    async def order_decision(cb: CallbackQuery):
+        if cb.from_user.id not in ADMIN_IDS:
+            return await cb.answer("Ruxsat yo’q", show_alert=True)
+        try:
+            _, action, oid_s = cb.data.split(":")
+            oid = int(oid_s)
+        except ValueError:
+            return await cb.answer("Xato")
+        status = "done" if action == "ok" else "rejected"
+        with tx() as con:
+            o, done, cb_sum, code = decide_order(con, oid, status, cb.from_user.id, time.time())
+        if not o:
+            return await cb.answer("Buyurtma topilmadi", show_alert=True)
+        if not done:
+            return await cb.answer("Bu buyurtma allaqachon ko’rib chiqilgan", show_alert=True)
+        auto = "\n🔑 Kod foydalanuvchiga avtomatik yuborildi." if code else (
+            "\n⚠️ Avtomatik kod yo’q: xizmatni o’zingiz yuborganingizga ishonch hosil qiling."
+            if status == "done" else "")
+        await edit_decided(cb, ("✅ Yuborildi" if status == "done" else "❌ Rad etildi (pul qaytarildi)") + auto)
+        gname = CATALOG_BY_ID.get(o["game"], {}).get("name", o["game"])
+        refunded = False
+        if status == "rejected" and o["pay"] == "stars" and o["charge_id"] and bot:
+            try:
+                await bot.refund_star_payment(user_id=o["user_id"], telegram_payment_charge_id=o["charge_id"])
+                refunded = True
+            except Exception as e:
+                log.error("Stars qaytarilmadi #%s: %s", oid, e)
+                await notify(cb.from_user.id, f"⚠️ Buyurtma #{oid} Stars ini avtomatik qaytarib bo’lmadi. Qo’lda qaytaring.")
+        if status == "done":
+            extra = f"\n🎁 Cashback: +{money(cb_sum)} so’m" if cb_sum else ""
+            if code:
+                extra += f"\n🔑 Kod: <code>{html.escape(code)}</code>\n{REDEEM_NOTE}"
+            await notify(
+                o["user_id"],
+                f"✅ Buyurtma #{o['id']} bajarildi: {html.escape(gname)} {html.escape(o['title'])} → "
+                f"<code>{html.escape(o['account'])}</code>{extra}",
+            )
+        else:
+            await notify(
+                o["user_id"],
+                f"❌ Buyurtma #{o['id']} rad etildi. "
+                + (f"{o['stars']} ⭐ qaytarildi." if refunded else
+                   "Stars ni admin qaytaradi." if o["pay"] == "stars" else
+                   f"{money(o['price'])} so’m hamyoningizga qaytarildi."),
+            )
+        await cb.answer("Tayyor")
+
+    dp = Dispatcher()
+    dp.include_router(router)
+    return dp
+
+
+# ---------------------------------------------------------------- FastAPI
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global bot, BOT_USERNAME
+    init_db()
+    poll_task = None
+    if BOT_TOKEN:
+        from aiogram import Bot
+        from aiogram.client.default import DefaultBotProperties
+        from aiogram.enums import ParseMode
+        from aiogram.types import MenuButtonWebApp, WebAppInfo
+
+        bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+        BOT_USERNAME = (await bot.get_me()).username or ""
+        if WEBAPP_URL:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="Tap", web_app=WebAppInfo(url=WEBAPP_URL))
+            )
+        else:
+            log.warning("WEBAPP_URL berilmagan: tugma/menyu o'rnatilmadi")
+        await bot.delete_webhook(drop_pending_updates=False)
+        dp = build_dispatcher()
+        poll_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
+        log.info("Bot ishga tushdi: @%s", BOT_USERNAME)
+    else:
+        log.warning("BOT_TOKEN yo'q: faqat API (lokal sinov rejimi, auth 'dev:<id>').")
+    yield
+    if poll_task:
+        poll_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await poll_task
+    if bot:
+        await bot.session.close()
+
+
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None)
+
+
+class TapBody(BaseModel):
+    taps: int = Field(ge=1, le=200)
+
+
+class WithdrawBody(BaseModel):
+    amount_uc: int
+    pubg_id: str = Field(max_length=32)
+
+
+class TopupBody(BaseModel):
+    amount: int
+
+
+class OrderBody(BaseModel):
+    game: str = Field(max_length=32)
+    item: int
+    account: str = Field(max_length=64)
+
+
+class StarsBody(BaseModel):
+    uc: int
+
+
+class SettingsBody(BaseModel):
+    notify: bool
+
+
+def valid_pubg(pubg: str) -> bool:
+    return pubg.isdigit() and 6 <= len(pubg) <= 14
+
+
+@app.get("/")
+async def index():
+    return FileResponse(WEBAPP_DIR / "index.html", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/games/{name}")
+async def game_image(name: str):
+    f = WEBAPP_DIR / "games" / name
+    if not re.fullmatch(r"[a-z0-9-]+\.(jpg|jpeg|png|webp|svg)", name) or not f.is_file():
+        raise HTTPException(404, "Topilmadi")
+    return FileResponse(f, headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+
+@app.post("/api/auth")
+async def api_auth(x_init_data: str = Header(default="")):
+    tg_user, start_param = authenticate(x_init_data)
+    t = time.time()
+    referrer = None
+    with tx() as con:
+        row, created = upsert_user(con, tg_user, t)
+        if row["banned"]:
+            raise HTTPException(403, "Hisob bloklangan.")
+        if created:
+            referrer = apply_referral(con, tg_user["id"], parse_ref(start_param))
+        payload = state_payload(con, tg_user["id"], t)
+    if referrer:
+        await notify_bonus(referrer, f"🎉 Yangi do’st qo’shildi! Hisobingizga +{REFERRAL_BONUS_UC} UC yozildi.")
+    return payload
+
+
+@app.post("/api/tap")
+async def api_tap(body: TapBody, x_init_data: str = Header(default="")):
+    tg_user, _ = authenticate(x_init_data)
+    t = time.time()
+    with tx() as con:
+        row = con.execute("SELECT * FROM users WHERE id=?", (tg_user["id"],)).fetchone()
+        if not row:
+            raise HTTPException(404, "Foydalanuvchi topilmadi.")
+        if row["banned"]:
+            raise HTTPException(403, "Hisob bloklangan.")
+        day = day_key(t)
+        used = row["today_c"] if row["day"] == day else 0
+        left_taps = max(0, (DAILY_LIMIT_C - used) // TAP_C)  # kunlik limit
+        elapsed = min(max(t - row["last_tap_ts"], 0.0), 3.0)
+        rate_cap = int(elapsed * MAX_TAPS_PER_SEC) + 3  # soxta tez bosishlardan himoya
+        accepted = max(0, min(body.taps, left_taps, rate_cap))
+        con.execute(
+            "UPDATE users SET balance_c=balance_c+?, day=?, today_c=?, last_tap_ts=?,"
+            " tap_total=tap_total+? WHERE id=?",
+            (accepted * TAP_C, day, used + accepted * TAP_C, t, accepted, tg_user["id"]),
+        )
+        bal = con.execute("SELECT balance_c FROM users WHERE id=?", (tg_user["id"],)).fetchone()[0]
+    return {"accepted": accepted, "balance_c": bal, "today_c": used + accepted * TAP_C}
+
+
+@app.post("/api/withdraw")
+async def api_withdraw(body: WithdrawBody, x_init_data: str = Header(default="")):
+    tg_user, _ = authenticate(x_init_data)
+    pubg = body.pubg_id.strip()
+    if not valid_pubg(pubg):
+        raise HTTPException(400, "PUBG ID noto’g’ri (faqat raqamlar, 6–14 ta).")
+    if body.amount_uc <= 0:
+        raise HTTPException(400, "Summa noto’g’ri.")
+    t = time.time()
+    with tx() as con:
+        row = con.execute("SELECT * FROM users WHERE id=?", (tg_user["id"],)).fetchone()
+        if not row:
+            raise HTTPException(404, "Foydalanuvchi topilmadi.")
+        if row["banned"]:
+            raise HTTPException(403, "Hisob bloklangan.")
+        amount_c = body.amount_uc * 100
+        paid_part = min(row["paid_c"], amount_c, row["balance_c"])  # Stars UC: do'st shart emas
+        if paid_part >= amount_c:
+            if body.amount_uc < MIN_PAID_WITHDRAW:
+                raise HTTPException(400, f"Minimal yechish: {MIN_PAID_WITHDRAW} UC.")
+        else:
+            if body.amount_uc < MIN_WITHDRAW_UC:
+                raise HTTPException(400, f"Minimal yechish: {MIN_WITHDRAW_UC} UC.")
+            if row["ref_count"] < REQUIRED_REFERRALS:
+                raise HTTPException(
+                    400,
+                    f"Yechish uchun kamida {REQUIRED_REFERRALS} ta do’st taklif qiling (hozir {row['ref_count']} ta).",
+                )
+        n_pending = con.execute(
+            "SELECT COUNT(*) FROM withdrawals WHERE user_id=? AND status='pending'", (row["id"],)
+        ).fetchone()[0]
+        if n_pending >= MAX_PENDING_WITHDRAWALS:
+            raise HTTPException(400, "Kutilayotgan so’rovlar ko’p. Avval ularning natijasini kuting.")
+        cur = con.execute(
+            "UPDATE users SET balance_c=balance_c-?, paid_c=paid_c-? WHERE id=? AND balance_c>=?",
+            (amount_c, paid_part, row["id"], amount_c),
+        )
+        if cur.rowcount != 1:
+            raise HTTPException(400, "Balans yetarli emas.")
+        wid = con.execute(
+            "INSERT INTO withdrawals(user_id, amount_c, pubg_id, created_at, paid_part_c) VALUES(?,?,?,?,?)",
+            (row["id"], amount_c, pubg, t, paid_part),
+        ).lastrowid
+        payload = state_payload(con, row["id"], t)
+        name, username, refs = row["first_name"], row["username"], row["ref_count"]
+    await notify_admins_withdrawal(wid, tg_user["id"], name, username, body.amount_uc, pubg, refs)
+    return payload
+
+
+@app.post("/api/topup")
+async def api_topup(body: TopupBody, x_init_data: str = Header(default="")):
+    tg_user, _ = authenticate(x_init_data)
+    if not (MIN_TOPUP <= body.amount <= MAX_TOPUP):
+        raise HTTPException(400, f"Summa {money(MIN_TOPUP)} dan {money(MAX_TOPUP)} so’mgacha bo’lishi kerak.")
+    if not PAY_CARD:
+        raise HTTPException(503, "To’ldirish hozircha ishlamayapti (to’lov rekvizitlari kiritilmagan).")
+    t = time.time()
+    with tx() as con:
+        row = con.execute("SELECT * FROM users WHERE id=?", (tg_user["id"],)).fetchone()
+        if not row:
+            raise HTTPException(404, "Foydalanuvchi topilmadi.")
+        if row["banned"]:
+            raise HTTPException(403, "Hisob bloklangan.")
+        n_open = con.execute(
+            "SELECT COUNT(*) FROM topups WHERE user_id=? AND status IN ('awaiting','review')", (row["id"],)
+        ).fetchone()[0]
+        if n_open >= MAX_OPEN_TOPUPS:
+            raise HTTPException(400, "Tugallanmagan to’ldirishlar ko’p. Avval ularni yakunlang.")
+        tid = create_topup(con, row["id"], body.amount, t)
+        payload = state_payload(con, row["id"], t)
+    payload["new_topup_id"] = tid
+    return payload
+
+
+@app.post("/api/order")
+async def api_order(body: OrderBody, x_init_data: str = Header(default="")):
+    tg_user, _ = authenticate(x_init_data)
+    game = CATALOG_BY_ID.get(body.game)
+    if not game:
+        raise HTTPException(400, "Bunday o’yin yo’q.")
+    if not game["packages"]:
+        raise HTTPException(400, "Bu o’yin hozircha mavjud emas.")
+    if not (0 <= body.item < len(game["packages"])):
+        raise HTTPException(400, "Bunday paket yo’q.")
+    account = body.account.strip()
+    if not re.fullmatch(game["id_pattern"], account):
+        raise HTTPException(400, f"{game['id_label']} noto’g’ri.")
+    pkg = game["packages"][body.item]
+    t = time.time()
+    with tx() as con:
+        row = con.execute("SELECT * FROM users WHERE id=?", (tg_user["id"],)).fetchone()
+        if not row:
+            raise HTTPException(404, "Foydalanuvchi topilmadi.")
+        if row["banned"]:
+            raise HTTPException(403, "Hisob bloklangan.")
+        n_open = con.execute(
+            "SELECT COUNT(*) FROM orders WHERE user_id=? AND status='processing'", (row["id"],)
+        ).fetchone()[0]
+        if n_open >= MAX_OPEN_ORDERS:
+            raise HTTPException(400, "Bajarilmagan buyurtmalar ko’p. Avval ularning natijasini kuting.")
+        cur = con.execute(
+            "UPDATE users SET wallet=wallet-? WHERE id=? AND wallet>=?", (pkg["price"], row["id"], pkg["price"])
+        )
+        if cur.rowcount != 1:
+            raise HTTPException(400, "Balans yetarli emas. Avval balansni to’ldiring.")
+        oid = create_order(con, row["id"], game["id"], pkg["title"], pkg["price"], account, t)
+        payload = state_payload(con, row["id"], t)
+        name, username = row["first_name"], row["username"]
+    payload["new_order_id"] = oid
+    await notify_admins_order(oid, tg_user["id"], name, username, game["name"], pkg["title"], pkg["price"], account)
+    return payload
+
+
+@app.post("/api/order/stars")
+async def api_order_stars(body: OrderBody, x_init_data: str = Header(default="")):
+    """Buyurtmani Stars bilan to'lash uchun invoice havolasi. To'lov tugagach bot buyurtmani faollashtiradi."""
+    tg_user, _ = authenticate(x_init_data)
+    if not bot:
+        raise HTTPException(503, "Stars faqat Telegram ichida ishlaydi.")
+    game = CATALOG_BY_ID.get(body.game)
+    if not game or not (0 <= body.item < len(game["packages"])):
+        raise HTTPException(400, "Bunday paket yo’q.")
+    pkg = game["packages"][body.item]
+    if not pkg.get("stars"):
+        raise HTTPException(400, "Bu paket Stars bilan sotilmaydi.")
+    account = body.account.strip()
+    if not re.fullmatch(game["id_pattern"], account):
+        raise HTTPException(400, f"{game['id_label']} noto’g’ri.")
+    t = time.time()
+    with tx() as con:
+        row = con.execute("SELECT * FROM users WHERE id=?", (tg_user["id"],)).fetchone()
+        if not row:
+            raise HTTPException(404, "Foydalanuvchi topilmadi.")
+        if row["banned"]:
+            raise HTTPException(403, "Hisob bloklangan.")
+        n_open = con.execute(
+            "SELECT COUNT(*) FROM orders WHERE user_id=? AND status='processing'", (row["id"],)
+        ).fetchone()[0]
+        if n_open >= MAX_OPEN_ORDERS:
+            raise HTTPException(400, "Bajarilmagan buyurtmalar ko’p. Avval ularning natijasini kuting.")
+        con.execute("DELETE FROM orders WHERE user_id=? AND status='unpaid'", (row["id"],))  # eski to'lanmaganlar
+        oid = con.execute(
+            "INSERT INTO orders(user_id, game, title, price, account, status, pay, stars, created_at)"
+            " VALUES(?,?,?,?,?,'unpaid','stars',?,?)",
+            (row["id"], game["id"], pkg["title"], pkg["price"], account, pkg["stars"], t),
+        ).lastrowid
+    from aiogram.types import LabeledPrice
+
+    try:
+        link = await bot.create_invoice_link(
+            title=f"{game['name']} · {pkg['title']}",
+            description=f"{game['name']} {pkg['title']} ni {pkg['stars']} Stars ga olish",
+            payload=f"buy:{oid}",
+            currency="XTR",
+            prices=[LabeledPrice(label=pkg["title"], amount=pkg["stars"])],
+        )
+    except Exception as e:
+        log.error("invoice xatosi: %s", e)
+        raise HTTPException(502, "To’lov havolasi yaratilmadi. Keyinroq urining.")
+    return {"link": link, "order_id": oid}
+
+
+@app.post("/api/stars")
+async def api_stars(body: StarsBody, x_init_data: str = Header(default="")):
+    """Stars to'lov havolasini (invoice link) yaratadi. UC to'lov tugagach bot orqali yoziladi."""
+    tg_user, _ = authenticate(x_init_data)
+    stars = STAR_PRICE.get(body.uc)
+    if stars is None:
+        raise HTTPException(400, "Bunday paket yo’q.")
+    if not bot:
+        raise HTTPException(503, "Stars faqat Telegram ichida ishlaydi.")
+    with db() as con:
+        row = con.execute("SELECT banned FROM users WHERE id=?", (tg_user["id"],)).fetchone()
+    if not row:
+        raise HTTPException(404, "Foydalanuvchi topilmadi.")
+    if row["banned"]:
+        raise HTTPException(403, "Hisob bloklangan.")
+    from aiogram.types import LabeledPrice
+
+    try:
+        link = await bot.create_invoice_link(
+            title=f"{body.uc} UC",
+            description=f"{body.uc} UC ni {stars} Stars ga almashtirish",
+            payload=f"uc:{tg_user['id']}:{body.uc}",
+            currency="XTR",
+            prices=[LabeledPrice(label=f"{body.uc} UC", amount=stars)],
+        )
+    except Exception as e:
+        log.error("invoice xatosi: %s", e)
+        raise HTTPException(502, "To’lov havolasi yaratilmadi. Keyinroq urining.")
+    return {"link": link}
+
+
+@app.post("/api/settings")
+async def api_settings(body: SettingsBody, x_init_data: str = Header(default="")):
+    tg_user, _ = authenticate(x_init_data)
+    with tx() as con:
+        con.execute("UPDATE users SET notify=? WHERE id=?", (1 if body.notify else 0, tg_user["id"]))
+    return {"notify": bool(body.notify)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
