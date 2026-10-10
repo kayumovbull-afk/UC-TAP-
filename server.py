@@ -29,7 +29,7 @@ except ImportError:  # python-dotenv ixtiyoriy
     pass
 
 from fastapi import FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -87,7 +87,13 @@ DAILY_LIMIT_C = round(DAILY_LIMIT_UC * 100)
 REF_C = REFERRAL_BONUS_UC * 100
 
 ROOT = Path(__file__).parent
-WEBAPP_DIR = ROOT / "webapp"
+WEBAPP_DIR = ROOT / "webapp" if (ROOT / "webapp").is_dir() else ROOT  # papka yo'q bo'lsa hammasi bitta joyda
+
+
+def game_img_path(name: str) -> Path:
+    """O'yin rasmi: webapp/games/<name> yoki (papkasiz tuzilishda) g-<name>."""
+    p = WEBAPP_DIR / "games" / name
+    return p if p.exists() else ROOT / ("g-" + name)
 CATALOG_FILE = ROOT / "catalog.json"
 bot = None  # aiogram Bot (BOT_TOKEN bo'lsa)
 BOT_USERNAME = ""
@@ -145,7 +151,7 @@ def load_catalog() -> list:
                 "id_label": str(g.get("id_label", "O’yin ID")),
                 "id_pattern": pattern, "popular": bool(g.get("popular", False)), "packages": pk,
                 "image": next((f"/games/{gid}{e}" for e in (".jpg", ".jpeg", ".png", ".webp", ".svg")
-                               if (WEBAPP_DIR / "games" / f"{gid}{e}").exists()), None) if re.fullmatch(r"[a-z0-9-]+", gid) else None,
+                               if game_img_path(f"{gid}{e}").exists()), None) if re.fullmatch(r"[a-z0-9-]+", gid) else None,
             })
             seen.add(gid)
         except Exception as e:
@@ -707,6 +713,80 @@ async def notify_admins_order(oid, user_id, name, username, game_name, title, pr
 
 
 # ---------------------------------------------------------------- bot (aiogram)
+async def process_withdrawal(wid: int, approve: bool, admin_id: int):
+    """Yechish so'rovini tasdiqlaydi/rad etadi va foydalanuvchiga xabar beradi. (natija, matn) qaytaradi."""
+    status = "paid" if approve else "rejected"
+    with tx() as con:
+        w, done, code = decide_withdrawal(con, wid, status, admin_id, time.time())
+    if not w:
+        return "notfound", ""
+    if not done:
+        return "already", ""
+    auto = "\n🔑 Kod foydalanuvchiga avtomatik yuborildi." if code else (
+        "\n⚠️ Zaxirada kod yo’q: UC ni o’zingiz yuborganingizga ishonch hosil qiling." if approve else "")
+    if approve:
+        if code:
+            await notify(w["user_id"], f"✅ {w['amount_c'] // 100} UC tasdiqlandi!\n🔑 Kod: <code>{html.escape(code)}</code>\n{REDEEM_NOTE}")
+        else:
+            await notify(w["user_id"], f"✅ {w['amount_c'] // 100} UC PUBG ID <code>{html.escape(w['pubg_id'])}</code> ga yuborildi!")
+    else:
+        await notify(w["user_id"], f"❌ {w['amount_c'] // 100} UC so’rovingiz rad etildi. Mablag’ balansingizga qaytarildi.")
+    return "ok", ("✅ To’landi" if approve else "❌ Rad etildi (balans qaytarildi)") + auto
+
+
+async def process_topup(tid: int, approve: bool, admin_id: int):
+    with tx() as con:
+        row, done = decide_topup(con, tid, "done" if approve else "rejected", admin_id, time.time())
+    if not row:
+        return "notfound", ""
+    if not done:
+        return "already", ""
+    if approve:
+        await notify(row["user_id"], f"✅ Hamyoningiz <b>{money(row['amount'])} so’m</b> ga to’ldirildi.")
+    else:
+        await notify(row["user_id"], f"❌ #{row['id']} to’lovingiz tasdiqlanmadi. Savol bo’lsa, admin bilan bog’laning.")
+    return "ok", "✅ Tasdiqlandi" if approve else "❌ Rad etildi"
+
+
+async def process_order(oid: int, approve: bool, admin_id: int):
+    status = "done" if approve else "rejected"
+    with tx() as con:
+        o, done, cb_sum, code = decide_order(con, oid, status, admin_id, time.time())
+    if not o:
+        return "notfound", ""
+    if not done:
+        return "already", ""
+    auto = "\n🔑 Kod foydalanuvchiga avtomatik yuborildi." if code else (
+        "\n⚠️ Avtomatik kod yo’q: xizmatni o’zingiz yuborganingizga ishonch hosil qiling." if approve else "")
+    gname = CATALOG_BY_ID.get(o["game"], {}).get("name", o["game"])
+    refunded = False
+    if not approve and o["pay"] == "stars" and o["charge_id"] and bot:
+        try:
+            await bot.refund_star_payment(user_id=o["user_id"], telegram_payment_charge_id=o["charge_id"])
+            refunded = True
+        except Exception as e:
+            log.error("Stars qaytarilmadi #%s: %s", oid, e)
+            await notify(admin_id, f"⚠️ Buyurtma #{oid} Stars ini avtomatik qaytarib bo’lmadi. Qo’lda qaytaring.")
+    if approve:
+        extra = f"\n🎁 Cashback: +{money(cb_sum)} so’m" if cb_sum else ""
+        if code:
+            extra += f"\n🔑 Kod: <code>{html.escape(code)}</code>\n{REDEEM_NOTE}"
+        await notify(
+            o["user_id"],
+            f"✅ Buyurtma #{o['id']} bajarildi: {html.escape(gname)} {html.escape(o['title'])} → "
+            f"<code>{html.escape(o['account'])}</code>{extra}",
+        )
+    else:
+        await notify(
+            o["user_id"],
+            f"❌ Buyurtma #{o['id']} rad etildi. "
+            + (f"{o['stars']} ⭐ qaytarildi." if refunded else
+               "Stars ni admin qaytaradi." if o["pay"] == "stars" else
+               f"{money(o['price'])} so’m hamyoningizga qaytarildi."),
+        )
+    return "ok", ("✅ Yuborildi" if approve else "❌ Rad etildi (pul qaytarildi)") + auto
+
+
 def build_dispatcher():
     from aiogram import Dispatcher, F, Router
     from aiogram.filters import Command, CommandObject, CommandStart
@@ -876,6 +956,13 @@ def build_dispatcher():
             n = add_codes(con, int(parts[0]), parts[1:])
         await m.answer(f"✅ {n} ta yangi kod qo’shildi ({int(parts[0])} UC). Takrorlari o’tkazib yuborildi.")
 
+    @router.message(Command("backup"))
+    async def backup_cmd(m: Message):
+        if m.from_user.id not in ADMIN_IDS:
+            return
+        await send_backup(force=True)
+        await m.answer("✅ Zaxira yuborildi va qadab qo’yildi.")
+
     @router.message(Command("codes"))
     async def codes_cmd(m: Message):
         if m.from_user.id not in ADMIN_IDS:
@@ -964,128 +1051,151 @@ def build_dispatcher():
             else:
                 await cb.message.edit_text(txt, reply_markup=None)
 
-    @router.callback_query(F.data.startswith("wd:"))
-    async def withdraw_decision(cb: CallbackQuery):
+    async def run_decision(cb: CallbackQuery, fn):
         if cb.from_user.id not in ADMIN_IDS:
             return await cb.answer("Ruxsat yo’q", show_alert=True)
         try:
-            _, action, wid_s = cb.data.split(":")
-            wid = int(wid_s)
+            _, action, id_s = cb.data.split(":")
+            rid = int(id_s)
         except ValueError:
             return await cb.answer("Xato")
-        status = "paid" if action == "ok" else "rejected"
-        with tx() as con:
-            w, done, code = decide_withdrawal(con, wid, status, cb.from_user.id, time.time())
-        if not w:
-            return await cb.answer("So’rov topilmadi", show_alert=True)
-        if not done:
-            return await cb.answer("Bu so’rov allaqachon ko’rib chiqilgan", show_alert=True)
-        auto = "\n🔑 Kod foydalanuvchiga avtomatik yuborildi." if code else (
-            "\n⚠️ Zaxirada kod yo’q: UC ni o’zingiz yuborganingizga ishonch hosil qiling." if status == "paid" else "")
-        await edit_decided(cb, ("✅ To’landi" if status == "paid" else "❌ Rad etildi (balans qaytarildi)") + auto)
-        if status == "paid":
-            if code:
-                await notify(
-                    w["user_id"],
-                    f"✅ {w['amount_c'] // 100} UC tasdiqlandi!\n🔑 Kod: <code>{html.escape(code)}</code>\n{REDEEM_NOTE}",
-                )
-            else:
-                await notify(
-                    w["user_id"],
-                    f"✅ {w['amount_c'] // 100} UC PUBG ID <code>{html.escape(w['pubg_id'])}</code> ga yuborildi!",
-                )
-        else:
-            await notify(
-                w["user_id"],
-                f"❌ {w['amount_c'] // 100} UC so’rovingiz rad etildi. Mablag’ balansingizga qaytarildi.",
-            )
+        res, label = await fn(rid, action == "ok", cb.from_user.id)
+        if res == "notfound":
+            return await cb.answer("Topilmadi", show_alert=True)
+        if res == "already":
+            return await cb.answer("Bu allaqachon ko’rib chiqilgan", show_alert=True)
+        await edit_decided(cb, label)
         await cb.answer("Tayyor")
+
+    @router.callback_query(F.data.startswith("wd:"))
+    async def withdraw_decision(cb: CallbackQuery):
+        await run_decision(cb, process_withdrawal)
 
     @router.callback_query(F.data.startswith("top:"))
     async def topup_decision(cb: CallbackQuery):
-        if cb.from_user.id not in ADMIN_IDS:
-            return await cb.answer("Ruxsat yo’q", show_alert=True)
-        try:
-            _, action, tid_s = cb.data.split(":")
-            tid = int(tid_s)
-        except ValueError:
-            return await cb.answer("Xato")
-        status = "done" if action == "ok" else "rejected"
-        with tx() as con:
-            row, done = decide_topup(con, tid, status, cb.from_user.id, time.time())
-        if not row:
-            return await cb.answer("To’lov topilmadi", show_alert=True)
-        if not done:
-            return await cb.answer("Bu to’lov allaqachon ko’rib chiqilgan", show_alert=True)
-        await edit_decided(cb, "✅ Tasdiqlandi" if status == "done" else "❌ Rad etildi")
-        if status == "done":
-            await notify(row["user_id"], f"✅ Hamyoningiz <b>{money(row['amount'])} so’m</b> ga to’ldirildi.")
-        else:
-            await notify(
-                row["user_id"],
-                f"❌ #{row['id']} to’lovingiz tasdiqlanmadi. Savol bo’lsa, admin bilan bog’laning.",
-            )
-        await cb.answer("Tayyor")
+        await run_decision(cb, process_topup)
 
     @router.callback_query(F.data.startswith("ord:"))
     async def order_decision(cb: CallbackQuery):
-        if cb.from_user.id not in ADMIN_IDS:
-            return await cb.answer("Ruxsat yo’q", show_alert=True)
-        try:
-            _, action, oid_s = cb.data.split(":")
-            oid = int(oid_s)
-        except ValueError:
-            return await cb.answer("Xato")
-        status = "done" if action == "ok" else "rejected"
-        with tx() as con:
-            o, done, cb_sum, code = decide_order(con, oid, status, cb.from_user.id, time.time())
-        if not o:
-            return await cb.answer("Buyurtma topilmadi", show_alert=True)
-        if not done:
-            return await cb.answer("Bu buyurtma allaqachon ko’rib chiqilgan", show_alert=True)
-        auto = "\n🔑 Kod foydalanuvchiga avtomatik yuborildi." if code else (
-            "\n⚠️ Avtomatik kod yo’q: xizmatni o’zingiz yuborganingizga ishonch hosil qiling."
-            if status == "done" else "")
-        await edit_decided(cb, ("✅ Yuborildi" if status == "done" else "❌ Rad etildi (pul qaytarildi)") + auto)
-        gname = CATALOG_BY_ID.get(o["game"], {}).get("name", o["game"])
-        refunded = False
-        if status == "rejected" and o["pay"] == "stars" and o["charge_id"] and bot:
-            try:
-                await bot.refund_star_payment(user_id=o["user_id"], telegram_payment_charge_id=o["charge_id"])
-                refunded = True
-            except Exception as e:
-                log.error("Stars qaytarilmadi #%s: %s", oid, e)
-                await notify(cb.from_user.id, f"⚠️ Buyurtma #{oid} Stars ini avtomatik qaytarib bo’lmadi. Qo’lda qaytaring.")
-        if status == "done":
-            extra = f"\n🎁 Cashback: +{money(cb_sum)} so’m" if cb_sum else ""
-            if code:
-                extra += f"\n🔑 Kod: <code>{html.escape(code)}</code>\n{REDEEM_NOTE}"
-            await notify(
-                o["user_id"],
-                f"✅ Buyurtma #{o['id']} bajarildi: {html.escape(gname)} {html.escape(o['title'])} → "
-                f"<code>{html.escape(o['account'])}</code>{extra}",
-            )
-        else:
-            await notify(
-                o["user_id"],
-                f"❌ Buyurtma #{o['id']} rad etildi. "
-                + (f"{o['stars']} ⭐ qaytarildi." if refunded else
-                   "Stars ni admin qaytaradi." if o["pay"] == "stars" else
-                   f"{money(o['price'])} so’m hamyoningizga qaytarildi."),
-            )
-        await cb.answer("Tayyor")
+        await run_decision(cb, process_order)
+
+    @router.message(Command("admin"))
+    async def admin_cmd(m: Message):
+        if m.from_user.id not in ADMIN_IDS:
+            return
+        if not WEBAPP_URL:
+            return await m.answer("WEBAPP_URL kiritilmagan.")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🛠 Admin panel", web_app=WebAppInfo(url=WEBAPP_URL + "/admin"))]]
+        )
+        await m.answer("Admin panel:", reply_markup=kb)
 
     dp = Dispatcher()
     dp.include_router(router)
     return dp
 
 
+# ---------------------------------------------------------------- zaxira (bepul server uchun)
+# Baza har BACKUP_MINUTES daqiqada birinchi adminning Telegram chatiga fayl qilib yuboriladi va
+# qadab (pin) qo'yiladi. Server o'chib bazasi yo'qolsa, bot shu qadalgan faylni o'zi tiklaydi.
+BACKUP_MINUTES = int(os.getenv("BACKUP_MINUTES", "30"))
+_last_backup_hash = ""
+
+
+def make_backup_file() -> Path:
+    """Ishlayotgan bazadan xavfsiz nusxa (sqlite backup API)."""
+    tmp = Path(DB_PATH + ".backup")
+    if tmp.exists():
+        tmp.unlink()
+    src = sqlite3.connect(DB_PATH, timeout=30)
+    dst = sqlite3.connect(str(tmp))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    return tmp
+
+
+async def send_backup(force: bool = False) -> bool:
+    global _last_backup_hash
+    if not bot or not ADMIN_IDS or not Path(DB_PATH).exists():
+        return False
+    from aiogram.types import FSInputFile
+
+    f = await asyncio.to_thread(make_backup_file)
+    h = hashlib.sha256(f.read_bytes()).hexdigest()
+    if h == _last_backup_hash and not force:
+        return False  # o'zgarish yo'q
+    admin = sorted(ADMIN_IDS)[0]
+    stamp = time.strftime("%Y-%m-%d %H:%M", time.gmtime(time.time() + 5 * 3600))
+    msg = await bot.send_document(
+        admin,
+        FSInputFile(f, filename="uckran-zaxira.db"),
+        caption=f"🗄 Baza zaxirasi ({stamp}). O’chirmang — bot shu fayldan tiklanadi.",
+        disable_notification=True,
+    )
+    try:
+        await bot.unpin_all_chat_messages(admin)
+        await bot.pin_chat_message(admin, msg.message_id, disable_notification=True)
+    except Exception as e:
+        log.warning("zaxirani qadab bo'lmadi: %s", e)
+    _last_backup_hash = h
+    with contextlib.suppress(Exception):
+        f.unlink()
+    return True
+
+
+async def backup_loop():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await send_backup()
+        except Exception as e:
+            log.warning("zaxira xatosi: %s", e)
+        await asyncio.sleep(max(5, BACKUP_MINUTES) * 60)
+
+
+async def restore_backup_if_needed(tmp_bot) -> bool:
+    """Baza yo'q bo'lsa, admin chatidagi qadalgan zaxira faylidan tiklaydi."""
+    if Path(DB_PATH).exists() or not ADMIN_IDS:
+        return False
+    for admin in sorted(ADMIN_IDS):
+        try:
+            chat = await tmp_bot.get_chat(admin)
+            doc = chat.pinned_message.document if chat.pinned_message else None
+            if not doc:
+                continue
+            Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+            await tmp_bot.download(doc.file_id, destination=DB_PATH)
+            con = sqlite3.connect(DB_PATH)
+            ok = con.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            con.close()
+            if ok:
+                log.warning("Baza zaxiradan tiklandi (admin %s)", admin)
+                return True
+            Path(DB_PATH).unlink()
+        except Exception as e:
+            log.warning("tiklash xatosi: %s", e)
+    return False
+
+
 # ---------------------------------------------------------------- FastAPI
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot, BOT_USERNAME
+    restored = False
+    if BOT_TOKEN and not Path(DB_PATH).exists():
+        from aiogram import Bot as _B
+
+        _tb = _B(BOT_TOKEN)
+        try:
+            restored = await restore_backup_if_needed(_tb)
+        finally:
+            await _tb.session.close()
     init_db()
     poll_task = None
+    backup_task = None
     if BOT_TOKEN:
         from aiogram import Bot
         from aiogram.client.default import DefaultBotProperties
@@ -1094,6 +1204,15 @@ async def lifespan(app: FastAPI):
 
         bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         BOT_USERNAME = (await bot.get_me()).username or ""
+        global SUPPORT_USERNAME
+        if not SUPPORT_USERNAME and ADMIN_IDS:  # "Adminga murojaat" uchun birinchi adminning @nomi
+            for aid in sorted(ADMIN_IDS):
+                try:
+                    SUPPORT_USERNAME = (await bot.get_chat(aid)).username or ""
+                except Exception as e:
+                    log.warning("admin username aniqlanmadi: %s", e)
+                if SUPPORT_USERNAME:
+                    break
         if WEBAPP_URL:
             await bot.set_chat_menu_button(
                 menu_button=MenuButtonWebApp(text="Tap", web_app=WebAppInfo(url=WEBAPP_URL))
@@ -1104,9 +1223,16 @@ async def lifespan(app: FastAPI):
         dp = build_dispatcher()
         poll_task = asyncio.create_task(dp.start_polling(bot, handle_signals=False))
         log.info("Bot ishga tushdi: @%s", BOT_USERNAME)
+        if ADMIN_IDS and BACKUP_MINUTES > 0:
+            backup_task = asyncio.create_task(backup_loop())
+        if restored and ADMIN_IDS:
+            with contextlib.suppress(Exception):
+                await bot.send_message(sorted(ADMIN_IDS)[0], "♻️ Server qayta yondi, baza oxirgi zaxiradan tiklandi.")
     else:
         log.warning("BOT_TOKEN yo'q: faqat API (lokal sinov rejimi, auth 'dev:<id>').")
     yield
+    if backup_task:
+        backup_task.cancel()
     if poll_task:
         poll_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1156,13 +1282,13 @@ async def index():
 
 @app.get("/games/{name}")
 async def game_image(name: str):
-    f = WEBAPP_DIR / "games" / name
+    f = game_img_path(name)
     if not re.fullmatch(r"[a-z0-9-]+\.(jpg|jpeg|png|webp|svg)", name) or not f.is_file():
         raise HTTPException(404, "Topilmadi")
     return FileResponse(f, headers={"Cache-Control": "public, max-age=3600"})
 
 
-@app.get("/healthz")
+@app.api_route("/healthz", methods=["GET", "HEAD"])
 async def healthz():
     return {"ok": True}
 
@@ -1408,6 +1534,104 @@ async def api_settings(body: SettingsBody, x_init_data: str = Header(default="")
     with tx() as con:
         con.execute("UPDATE users SET notify=? WHERE id=?", (1 if body.notify else 0, tg_user["id"]))
     return {"notify": bool(body.notify)}
+
+
+# ---------------------------------------------------------------- admin panel (veb)
+def require_admin(init_data: str) -> dict:
+    user, _ = authenticate(init_data)
+    if user["id"] not in ADMIN_IDS:
+        raise HTTPException(403, "Ruxsat yo’q.")
+    return user
+
+
+class DecideBody(BaseModel):
+    kind: str
+    id: int
+    approve: bool
+
+
+class CodesBody(BaseModel):
+    uc: int
+    codes: str
+
+
+@app.get("/admin")
+async def admin_page():
+    return FileResponse(WEBAPP_DIR / "admin.html", headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/admin/overview")
+async def api_admin_overview(x_init_data: str = Header(default="")):
+    require_admin(x_init_data)
+    with db() as con:
+        u = con.execute("SELECT COUNT(*) c, COALESCE(SUM(balance_c),0) uc, COALESCE(SUM(wallet),0) w FROM users").fetchone()
+        top_done = con.execute("SELECT COALESCE(SUM(amount),0) FROM topups WHERE status='done'").fetchone()[0]
+        ord_done = con.execute("SELECT COUNT(*) c, COALESCE(SUM(price),0) s FROM orders WHERE status='done'").fetchone()
+        stars = con.execute("SELECT COALESCE(SUM(stars),0) FROM star_payments").fetchone()[0]
+        tops = con.execute(
+            "SELECT t.id, t.amount, t.created_at, t.user_id, u.first_name, u.username FROM topups t"
+            " JOIN users u ON u.id=t.user_id WHERE t.status='review' ORDER BY t.id LIMIT 50").fetchall()
+        ords = con.execute(
+            "SELECT o.id, o.game, o.title, o.price, o.pay, o.stars, o.account, o.created_at, o.user_id, u.first_name, u.username"
+            " FROM orders o JOIN users u ON u.id=o.user_id WHERE o.status='processing' ORDER BY o.id LIMIT 50").fetchall()
+        wds = con.execute(
+            "SELECT w.id, w.amount_c, w.pubg_id, w.created_at, w.user_id, u.first_name, u.username, u.ref_count FROM withdrawals w"
+            " JOIN users u ON u.id=w.user_id WHERE w.status='pending' ORDER BY w.id LIMIT 50").fetchall()
+        codes = con.execute(
+            "SELECT uc, SUM(used_by IS NULL) free, COUNT(*) total FROM codes GROUP BY uc ORDER BY uc").fetchall()
+
+    def who(r):
+        return {"user_id": r["user_id"], "name": r["first_name"] or "", "username": r["username"] or ""}
+
+    return {
+        "stats": {"users": u["c"], "uc_total": u["uc"] / 100, "wallets": u["w"], "topups_done": top_done,
+                  "orders_done": ord_done["c"], "orders_sum": ord_done["s"], "stars_total": stars},
+        "topups": [{"id": r["id"], "amount": r["amount"], "created_at": r["created_at"], **who(r)} for r in tops],
+        "orders": [{"id": r["id"], "game": CATALOG_BY_ID.get(r["game"], {}).get("name", r["game"]), "title": r["title"],
+                    "price": r["price"], "pay": r["pay"], "stars": r["stars"], "account": r["account"],
+                    "created_at": r["created_at"], **who(r)} for r in ords],
+        "withdrawals": [{"id": r["id"], "uc": r["amount_c"] // 100, "pubg_id": r["pubg_id"], "refs": r["ref_count"],
+                         "created_at": r["created_at"], **who(r)} for r in wds],
+        "codes": [{"uc": r["uc"], "free": r["free"], "total": r["total"]} for r in codes],
+    }
+
+
+@app.post("/api/admin/decide")
+async def api_admin_decide(body: DecideBody, x_init_data: str = Header(default="")):
+    admin = require_admin(x_init_data)
+    fn = {"top": process_topup, "ord": process_order, "wd": process_withdrawal}.get(body.kind)
+    if not fn:
+        raise HTTPException(400, "Noto’g’ri tur.")
+    res, label = await fn(body.id, body.approve, admin["id"])
+    if res == "notfound":
+        raise HTTPException(404, "Topilmadi.")
+    return {"result": res, "label": label}
+
+
+@app.post("/api/admin/codes")
+async def api_admin_codes(body: CodesBody, x_init_data: str = Header(default="")):
+    require_admin(x_init_data)
+    codes = [c for c in body.codes.split() if 3 <= len(c) <= 64]
+    if body.uc <= 0 or not codes:
+        raise HTTPException(400, "UC miqdori va kamida bitta kod kerak.")
+    with tx() as con:
+        n = add_codes(con, body.uc, codes)
+    return {"added": n}
+
+
+@app.post("/api/admin/receipt/{tid}")
+async def api_admin_receipt(tid: int, x_init_data: str = Header(default="")):
+    require_admin(x_init_data)
+    with db() as con:
+        r = con.execute("SELECT receipt_file_id FROM topups WHERE id=?", (tid,)).fetchone()
+    if not r or not r["receipt_file_id"] or not bot:
+        raise HTTPException(404, "Chek topilmadi.")
+    try:
+        buf = await bot.download(r["receipt_file_id"])
+    except Exception as e:
+        log.error("chek yuklanmadi: %s", e)
+        raise HTTPException(502, "Chekni yuklab bo’lmadi.")
+    return Response(content=buf.getvalue(), media_type="image/jpeg")
 
 
 if __name__ == "__main__":
